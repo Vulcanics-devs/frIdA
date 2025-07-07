@@ -11,7 +11,7 @@ echo "=" * 60
 echo "🐍 Configurando entorno virtual..."
 if [ ! -d "venv" ]; then
     echo "📦 Creando entorno virtual..."
-    python -m venv venv
+    python3 -m venv venv
     if [ $? -ne 0 ]; then
         echo "❌ Error: No se pudo crear el entorno virtual"
         echo "💡 Asegúrate de tener python-venv instalado: sudo apt install python3-venv"

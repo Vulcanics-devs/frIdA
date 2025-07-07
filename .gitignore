@@ -11,11 +11,6 @@ mistral_7b_frida_finetuned/
 *.pt
 *.pth
 
-# Datos de entrenamiento
-training_data.jsonl
-formatted_data.jsonl
-*.jsonl
-
 # Logs
 logs/
 *.log
