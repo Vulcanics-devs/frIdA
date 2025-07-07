@@ -1,0 +1,64 @@
+# Entorno virtual
+venv/
+env/
+.venv/
+.env/
+
+# Modelos entrenados
+mistral_7b_frida_finetuned/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Datos de entrenamiento
+training_data.jsonl
+formatted_data.jsonl
+*.jsonl
+
+# Logs
+logs/
+*.log
+runs/
+wandb/
+
+# Cache de Hugging Face
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Archivos temporales
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Configuración local
+.env
+config.local.json
+
+# Checkpoints de entrenamiento
+checkpoint-*/
+pytorch_model.bin
+training_args.bin
+
+# TensorBoard
+events.out.tfevents.*

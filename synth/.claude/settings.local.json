@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(env)",
+      "Bash(python3:*)",
+      "Bash(gemini:*)",
+      "Bash(source .env)",
+      "Bash([ -n \"$GEMINI_API_KEY\" ])",
+      "Bash(chmod:*)",
+      "Bash(pip install:*)",
+      "Bash(sudo apt install:*)"
+    ],
+    "deny": []
+  }
+}
