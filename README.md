@@ -39,7 +39,19 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-> **Nota**: El script `launch_training.sh` crea automáticamente el entorno virtual si no existe.
+4. **Descargar modelo Mistral 7B Instruct**:
+```bash
+# Opción 1: Con Python
+python -c "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2'); print('Tokenizer descargado'); AutoModelForCausalLM.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2', torch_dtype='auto'); print('Modelo descargado')"
+
+# Opción 2: Con huggingface-cli
+huggingface-cli download mistralai/Mistral-7B-Instruct-v0.2
+
+# Si necesitas autenticación
+huggingface-cli login
+```
+
+> **Nota**: El script `launch_training.sh` crea automáticamente el entorno virtual si no existe y verifica que el modelo esté disponible.
 
 ## 📊 Estructura de Datos
 
@@ -62,7 +74,7 @@ bash launch_training.sh
 Este script:
 1. 🐍 Crea y activa entorno virtual automáticamente
 2. ✅ Verifica e instala dependencias
-3. 📥 Descarga el modelo Mistral 7B Instruct
+3. 🔍 Verifica que el modelo Mistral 7B Instruct esté disponible
 4. 🔄 Genera datos de entrenamiento desde `synth/format.py`
 5. 🚀 Inicia el entrenamiento distribuido
 6. 💾 Guarda el modelo entrenado
@@ -77,7 +89,10 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Generar datos
+# 2. Descargar modelo (si no está disponible)
+python -c "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2'); AutoModelForCausalLM.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2', torch_dtype='auto')"
+
+# 3. Generar datos
 cd synth
 python format.py
 mv formatted_data.jsonl ../training_data.jsonl
@@ -120,7 +135,54 @@ El script calcula automáticamente el número óptimo de épocas según el tama�
 
 > **Tip**: Puedes sobrescribir con `--epochs N` si tienes necesidades específicas.
 
-### Probar el Modelo
+### 💾 Checkpoints Automáticos
+
+El sistema crea automáticamente un checkpoint al final de cada época:
+
+### Estructura de Checkpoints
+```
+frIdA-7b/
+├── checkpoint-epoch-1/     # Checkpoint de la época 1
+├── checkpoint-epoch-2/     # Checkpoint de la época 2
+├── checkpoint-epoch-3/     # Checkpoint de la época 3
+├── epoch_info.json         # Información detallada de cada época
+└── ...                     # Modelo final
+```
+
+### Información de Épocas
+El archivo `epoch_info.json` contiene:
+- Loss de entrenamiento por época
+- Learning rate por época
+- Timestamp de cada checkpoint
+- Ruta de cada checkpoint
+- Número de steps globales
+
+### Cargar Checkpoint Específico
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+# Cargar modelo base
+base_model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+
+# Cargar checkpoint de época específica
+model = PeftModel.from_pretrained(base_model, "./frIdA-7b/checkpoint-epoch-2")
+
+# Cargar tokenizer
+tokenizer = AutoTokenizer.from_pretrained("./frIdA-7b")
+```
+
+### Comparar Épocas
+```bash
+# Ver información de todas las épocas
+cat frIdA-7b/epoch_info.json | jq '.[] | {epoch, train_loss, learning_rate}'
+
+# Probar diferentes checkpoints
+python test_model.py --model ./frIdA-7b/checkpoint-epoch-1
+python test_model.py --model ./frIdA-7b/checkpoint-epoch-2
+```
+
+## 🧪 Pruebas del Modelo
 
 Después del entrenamiento, puedes probar el modelo:
 
@@ -216,17 +278,26 @@ frida/
 ├── main.py                 # Script principal de entrenamiento
 ├── launch_training.sh      # Script automatizado de lanzamiento
 ├── activate_env.sh         # Script para activar entorno virtual
+├── debug_model.py          # Script de diagnóstico del modelo
 ├── test_model.py          # Script para probar el modelo
 ├── ds_config.json         # Configuración DeepSpeed
 ├── requirements.txt       # Dependencias Python
 ├── README.md              # Documentación
+├── .gitignore             # Archivos a ignorar en Git
 ├── venv/                  # Entorno virtual (creado automáticamente)
 ├── synth/                 # Carpeta con datos sintéticos
 │   ├── format.py         # Script para formatear datos
 │   └── ...
 ├── logs/                  # Logs de entrenamiento
 ├── training_data.jsonl    # Datos de entrenamiento (generado)
-└── mistral_7b_frida_finetuned/  # Modelo entrenado
+└── frIdA-7b/              # Modelo entrenado con checkpoints
+    ├── checkpoint-epoch-1/   # Checkpoint de época 1
+    ├── checkpoint-epoch-2/   # Checkpoint de época 2
+    ├── checkpoint-epoch-N/   # Checkpoint de época N
+    ├── epoch_info.json      # Información detallada de épocas
+    ├── config.json          # Configuración del modelo
+    ├── pytorch_model.bin    # Modelo final
+    └── tokenizer.json       # Tokenizer
 ```
 
 ## 🔧 Optimizaciones
@@ -251,6 +322,40 @@ frida/
 - **GPU Usage**: `nvidia-smi` durante entrenamiento
 
 ## 🐛 Troubleshooting
+
+### Error de Dispositivos (CPU/GPU)
+```
+module must have its parameters and buffers on device cuda:0 but found one of them on device: cpu
+```
+
+**Causa**: Conflicto entre DeepSpeed y device_map en la carga del modelo.
+
+**Soluciones**:
+1. **Ejecutar diagnóstico**:
+   ```bash
+   python debug_model.py
+   ```
+
+2. **Verificar configuración**:
+   - Asegúrate de que `device_map=None` en `main.py`
+   - DeepSpeed debe manejar la distribución de dispositivos
+   - No usar `device_map="auto"` con DeepSpeed
+
+3. **Reiniciar entrenamiento**:
+   ```bash
+   # Limpiar cache de GPU
+   python -c "import torch; torch.cuda.empty_cache()"
+   
+   # Relanzar entrenamiento
+   bash launch_training.sh
+   ```
+
+### Conflicto de Gradient Accumulation
+```
+Gradient accumulation steps mismatch: GradientAccumulationPlugin has X, DeepSpeed config has Y
+```
+
+**Solución**: Eliminar `gradient_accumulation_steps` de `ds_config.json` (ya corregido).
 
 ### Error de Memoria GPU
 ```bash

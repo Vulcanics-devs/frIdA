@@ -53,20 +53,23 @@ else
     fi
 fi
 
-# Paso 3: Descargar modelo Mistral 7B Instruct si no existe
-echo "📥 Verificando modelo Mistral 7B Instruct..."
-if [ ! -d "~/.cache/huggingface/hub" ] || ! python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2')" &> /dev/null; then
-    echo "📥 Descargando modelo Mistral 7B Instruct..."
-    python -c "
-from transformers import AutoTokenizer, AutoModelForCausalLM
-print('Descargando tokenizer...')
-tokenizer = AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2')
-print('Descargando modelo...')
-model = AutoModelForCausalLM.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2', torch_dtype='auto')
-print('✅ Modelo descargado exitosamente')
-"
+# Paso 3: Verificar que el modelo Mistral esté disponible
+echo "🔍 Verificando disponibilidad del modelo Mistral 7B Instruct..."
+if python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2')" &> /dev/null; then
+    echo "✅ Modelo Mistral 7B Instruct está disponible"
 else
-    echo "✅ Modelo Mistral ya está disponible"
+    echo "❌ Modelo Mistral 7B Instruct no encontrado"
+    echo ""
+    echo "📥 Para descargar el modelo manualmente, ejecuta:"
+    echo "   python -c \"from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2'); print('Tokenizer descargado'); AutoModelForCausalLM.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2', torch_dtype='auto'); print('Modelo descargado')\""
+    echo ""
+    echo "💡 O usa huggingface-cli:"
+    echo "   huggingface-cli download mistralai/Mistral-7B-Instruct-v0.2"
+    echo ""
+    echo "🔑 Si necesitas autenticación:"
+    echo "   huggingface-cli login"
+    echo ""
+    exit 1
 fi
 
 # Paso 4: Generar datos de entrenamiento desde synth
@@ -155,13 +158,20 @@ deepspeed --num_gpus=8 \
 # Verificar si el entrenamiento fue exitoso
 if [ $? -eq 0 ]; then
     echo "✅ Entrenamiento completado exitosamente!"
-    echo "📁 Modelo guardado en: ./mistral_7b_frida_finetuned"
+    echo "📁 Modelo guardado en: ./frIdA-7b"
     echo "📊 Logs guardados en: logs/"
     
     # Mostrar información del modelo entrenado
-    if [ -d "./mistral_7b_frida_finetuned" ]; then
-        model_size=$(du -sh ./mistral_7b_frida_finetuned | cut -f1)
+    if [ -d "./frIdA-7b" ]; then
+        model_size=$(du -sh ./frIdA-7b | cut -f1)
         echo "💾 Tamaño del modelo: $model_size"
+        
+        # Mostrar información de checkpoints
+        checkpoint_count=$(find ./frIdA-7b -name "checkpoint-epoch-*" -type d | wc -l)
+        if [ $checkpoint_count -gt 0 ]; then
+            echo "💾 Checkpoints creados: $checkpoint_count épocas"
+            echo "📄 Información detallada en: ./frIdA-7b/epoch_info.json"
+        fi
     fi
 else
     echo "❌ Error durante el entrenamiento"

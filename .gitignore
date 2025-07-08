@@ -6,6 +6,9 @@ env/
 
 # Modelos entrenados
 mistral_7b_frida_finetuned/
+checkpoint-*/
+checkpoint-epoch-*/
+epoch_info.json
 *.bin
 *.safetensors
 *.pt

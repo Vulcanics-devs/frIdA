@@ -9,31 +9,79 @@ import torch.distributed as dist
 import json
 import os
 from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer,
-    TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling
+    TrainingArguments,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainerCallback,
 )
+
+import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from datasets import Dataset
 import deepspeed
 from accelerate import Accelerator
 import argparse
+from datetime import datetime
 
 # Optimización de memoria para H100
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+
+class EpochCheckpointCallback(TrainerCallback):
+    """Callback personalizado para crear checkpoints detallados en cada época"""
+    
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+        self.epoch_info = []
+    
+    def on_epoch_end(self, args, state, control, model=None, tokenizer=None, **kwargs):
+        """Ejecutar al final de cada época"""
+        epoch = int(state.epoch)
+        
+        # Información de la época
+        # Obtener métricas de forma segura
+        train_loss = 0
+        learning_rate = 0
+        
+        if state.log_history and len(state.log_history) > 0:
+            last_log = state.log_history[-1]
+            train_loss = last_log.get("train_loss", 0)
+            learning_rate = last_log.get("learning_rate", 0)
+        
+        epoch_data = {
+            "epoch": epoch,
+            "global_step": state.global_step,
+            "train_loss": train_loss,
+            "learning_rate": learning_rate,
+            "timestamp": datetime.now().isoformat(),
+            "checkpoint_dir": f"{self.output_dir}/checkpoint-epoch-{epoch}"
+        }
+        
+        self.epoch_info.append(epoch_data)
+        
+        # Guardar información de épocas
+        epoch_info_path = os.path.join(self.output_dir, "epoch_info.json")
+        with open(epoch_info_path, "w") as f:
+            json.dump(self.epoch_info, f, indent=2)
+        
+        print(f"\n📊 Época {epoch} completada:")
+        print(f"   📈 Loss: {epoch_data['train_loss']:.4f}")
+        print(f"   📚 Learning Rate: {epoch_data['learning_rate']:.2e}")
+        print(f"   💾 Checkpoint: {epoch_data['checkpoint_dir']}")
+        print(f"   🕐 Timestamp: {epoch_data['timestamp']}")
+        
+        return control
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 
 def parse_arguments():
     """Parsear argumentos de línea de comandos"""
     parser = argparse.ArgumentParser(description="Fine-tuning de Mistral 7B con LoRA y DeepSpeed")
-    parser.add_argument("--model", default="mistralai/Mistral-7B-Instruct-v0.2", 
+    parser.add_argument("--model", default="./Mistral-7B-Instruct-v0.3", 
                        help="Nombre del modelo base")
-    parser.add_argument("--data", default="training_data.jsonl", 
+    parser.add_argument("--data", default="formatted_data.jsonl", 
                        help="Archivo de datos de entrenamiento")
-    parser.add_argument("--output", default="./mistral_7b_frida_finetuned", 
+    parser.add_argument("--output", default="./frida_7b", 
                        help="Directorio de salida")
     parser.add_argument("--epochs", type=int, default=None, 
                        help="Número de épocas (sobrescribe cálculo automático)")
@@ -97,20 +145,63 @@ def setup_model_and_tokenizer(args):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Modelo con optimizaciones para multi-GPU
+    # Modelo con optimizaciones para multi-GPU y DeepSpeed
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,  # Mejor para H100
-        device_map="auto",  # Distribución automática entre GPUs
+        device_map=None,  # Dejar que DeepSpeed maneje la distribución
         use_cache=False,  # Ahorra memoria durante entrenamiento
         attn_implementation="flash_attention_2",  # Flash Attention 2 para H100
         trust_remote_code=True
     )
     
+    # Mover modelo a GPU principal antes de LoRA
+    if torch.cuda.is_available():
+        model = model.to("cuda", dtype=torch.bfloat16)
+    
+    # Asegurar que todos los parámetros estén en bfloat16 para FlashAttention
+    for param in model.parameters():
+        if param.dtype != torch.bfloat16:
+            param.data = param.data.to(torch.bfloat16)
+    
     # Preparar modelo para entrenamiento cuantizado
     model = prepare_model_for_kbit_training(model)
     
     return model, tokenizer
+
+def ensure_model_device_consistency(model):
+    """Asegurar que todos los parámetros del modelo estén en el mismo dispositivo y tipo de datos"""
+    if not torch.cuda.is_available():
+        return model
+    
+    target_device = "cuda:0"
+    target_dtype = torch.bfloat16
+    
+    # Verificar y mover parámetros que estén en CPU o tipo incorrecto
+    for name, param in model.named_parameters():
+        needs_move = param.device.type == 'cpu'
+        needs_cast = param.dtype != target_dtype and param.dtype.is_floating_point
+        
+        if needs_move or needs_cast:
+            if needs_move:
+                print(f"🔄 Moviendo parámetro {name} de CPU a {target_device}")
+            if needs_cast:
+                print(f"🔄 Convirtiendo parámetro {name} de {param.dtype} a {target_dtype}")
+            param.data = param.data.to(device=target_device, dtype=target_dtype if needs_cast else param.dtype)
+    
+    # Verificar buffers también
+    for name, buffer in model.named_buffers():
+        needs_move = buffer.device.type == 'cpu'
+        needs_cast = buffer.dtype != target_dtype and buffer.dtype.is_floating_point
+        
+        if needs_move or needs_cast:
+            if needs_move:
+                print(f"🔄 Moviendo buffer {name} de CPU a {target_device}")
+            if needs_cast:
+                print(f"🔄 Convirtiendo buffer {name} de {buffer.dtype} a {target_dtype}")
+            buffer.data = buffer.data.to(device=target_device, dtype=target_dtype if needs_cast else buffer.dtype)
+    
+    return model
 
 def setup_lora(model):
     """Configurar LoRA para entrenamiento eficiente en Mistral 7B"""
@@ -127,8 +218,13 @@ def setup_lora(model):
         modules_to_save=["lm_head", "embed_tokens"]  # Entrenar también embeddings
     )
     
+    # Aplicar LoRA
     model = get_peft_model(model, lora_config)
-    print("📊 Parámetros del modelo:")
+    
+    # Asegurar consistencia de dispositivos después de LoRA
+    model = ensure_model_device_consistency(model)
+    
+    # Mostrar parámetros entrenables
     model.print_trainable_parameters()
     
     return model
@@ -154,33 +250,48 @@ def calculate_optimal_epochs(dataset_size):
     print(f"💡 Razón: Evitar overfitting y optimizar tiempo de entrenamiento")
     return epochs
 
-def tokenize_data(data, tokenizer, max_length=2048):
-    """Tokenizar los datos con longitud optimizada para Mistral"""
+def tokenize_data(file_path, tokenizer, max_length=2048):
+    """Carga, tokeniza y prepara el dataset, añadiendo la columna 'labels'."""
+    print(f"📂 Cargando dataset desde {file_path}...")
+    dataset = load_dataset('json', data_files=file_path, split='train')
+    if len(dataset) == 0:
+        raise ValueError("El archivo de datos está vacío.")
+
     def tokenize_function(examples):
-        # Tokenizar con labels para entrenamiento causal
-        tokenized = tokenizer(
+        """Función para tokenizar los textos."""
+        return tokenizer(
             examples["text"],
             truncation=True,
-            padding=False,  # Padding dinámico en data collator
             max_length=max_length,
-            return_overflowing_tokens=False,
-            add_special_tokens=False  # Ya están en el texto
+            add_special_tokens=False
         )
-        
-        # Para entrenamiento causal, labels = input_ids
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        
-        return tokenized
-    
-    dataset = Dataset.from_list(data)
+
+    print("🔄 Tokenizando el dataset...")
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
+        num_proc=4,
         remove_columns=dataset.column_names,
-        num_proc=8,  # Paralelización para velocidad
-        desc="Tokenizando datos"
+        desc="Tokenizando"
     )
-    
+
+    def add_labels(examples):
+        """Añade la columna 'labels' como una copia de 'input_ids'."""
+        examples["labels"] = examples["input_ids"].copy()
+        return examples
+
+    print("🏷️  Añadiendo labels al dataset...")
+    tokenized_dataset = tokenized_dataset.map(
+        add_labels, 
+        batched=True, 
+        num_proc=4, 
+        desc="Añadiendo labels"
+    )
+
+    if len(tokenized_dataset) == 0:
+        raise ValueError("El dataset tokenizado está vacío.")
+
+    print(f"✅ Dataset listo: {len(tokenized_dataset)} ejemplos.")
     return tokenized_dataset
 
 def main(args):
@@ -221,12 +332,8 @@ def main(args):
     else:
         optimal_epochs = calculate_optimal_epochs(dataset_size)
     
-    # 6. Data collator optimizado
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-        pad_to_multiple_of=8,  # Optimización para H100
-    )
+    # 6. Usar el DataCollator estándar para Causal LM
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
     # 7. Configuración de entrenamiento optimizada para 8x H100
     training_args = TrainingArguments(
@@ -242,12 +349,12 @@ def main(args):
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
         
-        # Guardado y logging
-        save_strategy="steps",
-        save_steps=500,
-        save_total_limit=3,
+        # Guardado y logging - Checkpoint en cada época
+        save_strategy="epoch",  # Guardar en cada época
+        save_total_limit=None,  # Mantener todos los checkpoints de época
         logging_strategy="steps",
         logging_steps=50,
+        
         logging_dir=f"{output_dir}/logs",
         
         # Optimizaciones de memoria y velocidad
@@ -270,23 +377,123 @@ def main(args):
         run_name="frIdA-7b",
         
         # Evaluación
-        evaluation_strategy="no",  # Sin evaluación para maximizar velocidad
+        eval_strategy="no",  # Sin evaluación para maximizar velocidad
         load_best_model_at_end=False,
         
         # DeepSpeed
         deepspeed="ds_config.json",  # Configuración DeepSpeed
     )
     
-    # 8. Trainer con optimizaciones
+    # 8. Validar data collator con una muestra del dataset
+    print("🧪 Validando data collator...")
+    try:
+        # Tomar una pequeña muestra para probar el data collator
+        test_features = [tokenized_dataset[i] for i in range(min(2, len(tokenized_dataset)))]
+        test_batch = data_collator(test_features)
+        
+        print(f"✅ Data collator validado:")
+        print(f"   - input_ids shape: {test_batch['input_ids'].shape}")
+        print(f"   - attention_mask shape: {test_batch['attention_mask'].shape}")
+        print(f"   - labels shape: {test_batch['labels'].shape}")
+        print(f"   - input_ids dtype: {test_batch['input_ids'].dtype}")
+        print(f"   - labels dtype: {test_batch['labels'].dtype}")
+        
+        # Verificar que labels no sean None
+        if test_batch['labels'] is None:
+            raise ValueError("Labels son None después del data collator")
+        
+        # Verificar que no haya valores NaN
+        if torch.isnan(test_batch['input_ids']).any():
+            raise ValueError("input_ids contienen valores NaN")
+        if torch.isnan(test_batch['labels']).any():
+            raise ValueError("labels contienen valores NaN")
+            
+        print("✅ Data collator funciona correctamente")
+        
+    except Exception as e:
+        print(f"❌ Error validando data collator: {e}")
+        raise
+    
+    # 9. Callback personalizado para checkpoints de época
+    epoch_callback = EpochCheckpointCallback(output_dir)
+    
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        callbacks=[epoch_callback],
     )
     
-    # 9. Entrenar
+    # Asegurar que el modelo esté en el dispositivo correcto y tipo de datos antes del entrenamiento
+    if hasattr(trainer.model, 'base_model'):
+        # Para modelos PEFT, asegurar que el modelo base esté en GPU y bfloat16
+        if torch.cuda.is_available():
+            trainer.model.base_model.model = trainer.model.base_model.model.to("cuda", dtype=torch.bfloat16)
+    
+    # Verificación final: asegurar que todos los parámetros estén en bfloat16 para FlashAttention
+    print("🔍 Verificando tipos de datos para FlashAttention...")
+    for name, param in trainer.model.named_parameters():
+        if param.dtype.is_floating_point and param.dtype != torch.bfloat16:
+            print(f"⚠️ Parámetro {name} en {param.dtype}, convirtiendo a bfloat16")
+            param.data = param.data.to(torch.bfloat16)
+    
+    for name, buffer in trainer.model.named_buffers():
+        if buffer.dtype.is_floating_point and buffer.dtype != torch.bfloat16:
+            print(f"⚠️ Buffer {name} en {buffer.dtype}, convirtiendo a bfloat16")
+            buffer.data = buffer.data.to(torch.bfloat16)
+    
+    print("✅ Verificación de tipos de datos completada")
+    
+    # 11. Verificar datos antes del entrenamiento
+    print("🔍 Verificando datos antes del entrenamiento...")
+    
+    # Verificar que el dataset tokenizado tenga datos
+    if len(tokenized_dataset) == 0:
+        raise ValueError("Dataset tokenizado está vacío")
+    
+    # Verificar un ejemplo del dataset
+    try:
+        sample = tokenized_dataset[0]
+        print(f"🔍 Tipo de sample: {type(sample)}")
+        print(f"🔍 Keys en sample: {list(sample.keys()) if isinstance(sample, dict) else 'No es dict'}")
+        
+        if not isinstance(sample, dict):
+            raise ValueError(f"Dataset sample no es un diccionario, es: {type(sample)}")
+        
+        if "input_ids" not in sample:
+            raise ValueError(f"Dataset no contiene input_ids. Keys: {list(sample.keys())}")
+        
+        if len(sample["input_ids"]) == 0:
+            raise ValueError("input_ids están vacíos")
+        
+        print(f"✅ Dataset verificado: {len(tokenized_dataset)} ejemplos")
+        
+        # Calcular longitud promedio de forma segura
+        total_length = 0
+        sample_count = min(100, len(tokenized_dataset))
+        
+        for i in range(sample_count):
+            try:
+                ex = tokenized_dataset[i]
+                if isinstance(ex, dict) and "input_ids" in ex:
+                    total_length += len(ex["input_ids"])
+                else:
+                    print(f"⚠️ Ejemplo {i} no tiene formato correcto")
+            except Exception as e:
+                print(f"⚠️ Error accediendo ejemplo {i}: {e}")
+        
+        avg_length = total_length // sample_count if sample_count > 0 else 0
+        print(f"📏 Longitud promedio: {avg_length} tokens")
+        
+    except Exception as e:
+        print(f"❌ Error verificando dataset: {e}")
+        print(f"🔍 Tipo de tokenized_dataset: {type(tokenized_dataset)}")
+        if hasattr(tokenized_dataset, '__len__'):
+            print(f"🔍 Longitud del dataset: {len(tokenized_dataset)}")
+        raise
+    
+    # 12. Entrenar
     print("🚀 Iniciando entrenamiento distribuido...")
     print(f"📊 Batch size efectivo: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * torch.cuda.device_count()}")
     
@@ -297,7 +504,17 @@ def main(args):
         # Guardar modelo final
         trainer.save_model()
         tokenizer.save_pretrained(output_dir)
-        print(f"💾 Modelo guardado en: {output_dir}")
+        print(f"💾 Modelo final guardado en: {output_dir}")
+        
+        # Mostrar información de checkpoints
+        print("\n📁 Checkpoints creados:")
+        for epoch_data in epoch_callback.epoch_info:
+            print(f"   Época {epoch_data['epoch']}: {epoch_data['checkpoint_dir']}")
+        
+        print(f"\n📊 Información detallada guardada en: {output_dir}/epoch_info.json")
+        print("📊 Para cargar un checkpoint específico:")
+        print(f"   from transformers import AutoModelForCausalLM")
+        print(f"   model = AutoModelForCausalLM.from_pretrained('{output_dir}/checkpoint-epoch-X')")
         
     except torch.cuda.OutOfMemoryError:
         print("❌ Error de memoria GPU!")
